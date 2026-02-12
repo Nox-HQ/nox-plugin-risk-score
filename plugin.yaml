@@ -1,0 +1,11 @@
+name: nox-plugin-risk-score
+version: 0.1.0
+track: intelligence
+description: Enriches vulnerability findings with EPSS scores and CISA KEV status
+tools:
+  - name: enrich_findings
+    description: Enriches findings with EPSS scores and KEV status
+  - name: get_epss
+    description: Get EPSS score for a CVE
+  - name: get_kev_status
+    description: Check if CVE is in CISA Known Exploited Vulnerabilities

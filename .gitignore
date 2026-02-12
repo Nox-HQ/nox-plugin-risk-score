@@ -1,0 +1,9 @@
+# Binaries
+nox-plugin-risk-score
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
