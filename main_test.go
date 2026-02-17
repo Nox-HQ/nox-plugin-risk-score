@@ -1,9 +1,162 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"testing"
+
+	pluginv1 "github.com/nox-hq/nox/gen/nox/plugin/v1"
+	"github.com/nox-hq/nox/registry"
+	"github.com/nox-hq/nox/sdk"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/structpb"
 )
+
+func TestConformance(t *testing.T) {
+	srv := buildServer()
+	sdk.RunConformance(t, srv)
+}
+
+func TestTrackConformance(t *testing.T) {
+	srv := buildServer()
+	sdk.RunForTrack(t, srv, registry.TrackIntelligence)
+}
+
+func TestEnrichFindingsWithScanContext(t *testing.T) {
+	client := testClient(t)
+
+	input, err := structpb.NewStruct(map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.InvokeTool(context.Background(), &pluginv1.InvokeToolRequest{
+		ToolName: "enrich_findings",
+		Input:    input,
+		ScanContext: &pluginv1.ScanContext{
+			Findings: []*pluginv1.Finding{
+				{
+					RuleId:      "VULN-001",
+					Severity:    sdk.SeverityCritical,
+					Confidence:  sdk.ConfidenceHigh,
+					Message:     "CVE-2021-44228 in Log4j",
+					Fingerprint: "fp-vuln-001",
+					Metadata:    map[string]string{"cve": "CVE-2021-44228"},
+				},
+				{
+					RuleId:     "SEC-001",
+					Severity:   sdk.SeverityHigh,
+					Confidence: sdk.ConfidenceHigh,
+					Message:    "Hardcoded secret (no CVE)",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InvokeTool: %v", err)
+	}
+
+	// Only VULN-001 has a CVE, so only 1 enrichment.
+	if len(resp.GetEnrichments()) != 1 {
+		t.Fatalf("expected 1 enrichment, got %d", len(resp.GetEnrichments()))
+	}
+
+	e := resp.GetEnrichments()[0]
+	if e.GetKind() != "risk-score" {
+		t.Errorf("kind = %q, want risk-score", e.GetKind())
+	}
+	if e.GetMetadata()["cve"] != "CVE-2021-44228" {
+		t.Errorf("cve metadata = %q, want CVE-2021-44228", e.GetMetadata()["cve"])
+	}
+	if e.GetSource() != "nox/risk-score" {
+		t.Errorf("source = %q, want nox/risk-score", e.GetSource())
+	}
+}
+
+func TestGetEPSS(t *testing.T) {
+	client := testClient(t)
+
+	input, err := structpb.NewStruct(map[string]any{
+		"cve_id": "CVE-2021-44228",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.InvokeTool(context.Background(), &pluginv1.InvokeToolRequest{
+		ToolName: "get_epss",
+		Input:    input,
+	})
+	if err != nil {
+		t.Fatalf("InvokeTool: %v", err)
+	}
+
+	if len(resp.GetEnrichments()) != 1 {
+		t.Fatalf("expected 1 enrichment, got %d", len(resp.GetEnrichments()))
+	}
+
+	e := resp.GetEnrichments()[0]
+	if e.GetKind() != "epss-score" {
+		t.Errorf("kind = %q, want epss-score", e.GetKind())
+	}
+	if e.GetMetadata()["cve"] != "CVE-2021-44228" {
+		t.Errorf("cve = %q, want CVE-2021-44228", e.GetMetadata()["cve"])
+	}
+}
+
+func TestGetEPSSEmpty(t *testing.T) {
+	client := testClient(t)
+
+	input, err := structpb.NewStruct(map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.InvokeTool(context.Background(), &pluginv1.InvokeToolRequest{
+		ToolName: "get_epss",
+		Input:    input,
+	})
+	if err != nil {
+		t.Fatalf("InvokeTool: %v", err)
+	}
+
+	if len(resp.GetEnrichments()) != 0 {
+		t.Errorf("expected 0 enrichments for empty cve_id, got %d", len(resp.GetEnrichments()))
+	}
+}
+
+func TestGetKEVStatus(t *testing.T) {
+	client := testClient(t)
+
+	input, err := structpb.NewStruct(map[string]any{
+		"cve_id": "CVE-2023-44487",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.InvokeTool(context.Background(), &pluginv1.InvokeToolRequest{
+		ToolName: "get_kev_status",
+		Input:    input,
+	})
+	if err != nil {
+		t.Fatalf("InvokeTool: %v", err)
+	}
+
+	if len(resp.GetEnrichments()) != 1 {
+		t.Fatalf("expected 1 enrichment, got %d", len(resp.GetEnrichments()))
+	}
+
+	e := resp.GetEnrichments()[0]
+	if e.GetKind() != "kev-status" {
+		t.Errorf("kind = %q, want kev-status", e.GetKind())
+	}
+}
+
+// --- Domain logic unit tests (preserved from Gen 1) ---
 
 func TestParseEPSSResponse(t *testing.T) {
 	tests := []struct {
@@ -320,26 +473,30 @@ func TestEnrichFinding(t *testing.T) {
 	})
 }
 
-func TestGetEPSSStub(t *testing.T) {
-	_, err := getEPSS("CVE-2021-44228")
-	if err == nil {
-		t.Fatal("expected stub error, got nil")
-	}
-}
+// --- helpers ---
 
-func TestGetKEVStatusStub(t *testing.T) {
-	_, err := getKEVStatus("CVE-2021-44228")
-	if err == nil {
-		t.Fatal("expected stub error, got nil")
-	}
-}
+func testClient(t *testing.T) pluginv1.PluginServiceClient {
+	t.Helper()
+	const bufSize = 1024 * 1024
 
-func TestEnrichFindingsStub(t *testing.T) {
-	findings := []map[string]string{
-		{"rule_id": "VULN-001", "cve": "CVE-2021-44228"},
+	lis := bufconn.Listen(bufSize)
+	grpcServer := grpc.NewServer()
+	pluginv1.RegisterPluginServiceServer(grpcServer, buildServer())
+
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(func() { grpcServer.Stop() })
+
+	conn, err := grpc.NewClient(
+		"passthrough:///bufconn",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
 	}
-	_, err := enrichFindings(findings)
-	if err == nil {
-		t.Fatal("expected stub error, got nil")
-	}
+	t.Cleanup(func() { conn.Close() })
+
+	return pluginv1.NewPluginServiceClient(conn)
 }

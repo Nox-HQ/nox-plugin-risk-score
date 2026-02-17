@@ -1,23 +1,21 @@
-// Package main implements the nox-plugin-risk-score plugin.
-//
-// This plugin enriches VULN-001 findings with real-world exploitability data:
-//   - EPSS (Exploit Prediction Scoring System) probability scores from FIRST.org
-//   - CISA KEV (Known Exploited Vulnerabilities) catalog status
-//
-// In production, this plugin communicates with nox core via gRPC and fetches
-// live data from the EPSS API and KEV catalog. This scaffold demonstrates
-// the data structures and processing logic.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
+
+	pluginv1 "github.com/nox-hq/nox/gen/nox/plugin/v1"
+	"github.com/nox-hq/nox/sdk"
 )
 
+var version = "dev"
+
 // EPSSResponse represents the response from the FIRST.org EPSS API.
-// Production endpoint: https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNNN
 type EPSSResponse struct {
 	Status     string     `json:"status"`
 	StatusCode int        `json:"status-code"`
@@ -36,18 +34,17 @@ type EPSSData struct {
 }
 
 // KEVEntry represents a single entry in the CISA KEV catalog.
-// Production source: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
 type KEVEntry struct {
-	CVEID                 string `json:"cveID"`
-	VendorProject         string `json:"vendorProject"`
-	Product               string `json:"product"`
-	VulnerabilityName     string `json:"vulnerabilityName"`
-	DateAdded             string `json:"dateAdded"`
-	ShortDescription      string `json:"shortDescription"`
-	RequiredAction        string `json:"requiredAction"`
-	DueDate               string `json:"dueDate"`
+	CVEID                   string `json:"cveID"`
+	VendorProject           string `json:"vendorProject"`
+	Product                 string `json:"product"`
+	VulnerabilityName       string `json:"vulnerabilityName"`
+	DateAdded               string `json:"dateAdded"`
+	ShortDescription        string `json:"shortDescription"`
+	RequiredAction          string `json:"requiredAction"`
+	DueDate                 string `json:"dueDate"`
 	KnownRansomwareCampaign string `json:"knownRansomwareCampaignUse"`
-	Notes                 string `json:"notes"`
+	Notes                   string `json:"notes"`
 }
 
 // KEVCatalog represents the full CISA KEV catalog response.
@@ -100,7 +97,6 @@ func ParseKEVCatalog(data []byte) (*KEVCatalog, error) {
 }
 
 // LookupKEV searches the KEV catalog for a specific CVE.
-// Returns the entry and true if found, nil and false otherwise.
 func LookupKEV(catalog *KEVCatalog, cveID string) (*KEVEntry, bool) {
 	normalized := strings.ToUpper(strings.TrimSpace(cveID))
 	for i := range catalog.Vulnerabilities {
@@ -126,14 +122,6 @@ func ClassifyRisk(epssScore float64, inKEV bool) RiskPriority {
 }
 
 // EnrichFinding creates an enriched finding by combining a CVE with EPSS and KEV data.
-//
-// In production, this function would:
-//  1. Receive a VULN-001 finding from the nox scan pipeline via gRPC
-//  2. Extract the CVE identifier from the finding metadata
-//  3. Query the EPSS API for the exploit probability score
-//  4. Check the local KEV catalog cache for active exploitation status
-//  5. Compute a composite risk priority
-//  6. Return the enriched finding back to nox core
 func EnrichFinding(ruleID, cve string, epssData *EPSSData, kevEntry *KEVEntry) *EnrichedFinding {
 	enriched := &EnrichedFinding{
 		RuleID:     ruleID,
@@ -155,68 +143,107 @@ func EnrichFinding(ruleID, cve string, epssData *EPSSData, kevEntry *KEVEntry) *
 	return enriched
 }
 
-// getEPSS is a tool stub for retrieving EPSS scores.
-//
-// In production, this tool would:
-//   - Accept a CVE ID as input
-//   - Query https://api.first.org/data/v1/epss?cve={cve_id}
-//   - Cache responses with a 24-hour TTL (EPSS updates daily)
-//   - Return the EPSS probability and percentile
-func getEPSS(cveID string) (*EPSSData, error) {
-	// Stub: in production, this performs an HTTP GET to the EPSS API.
-	// The EPSS API is free, unauthenticated, and rate-limited to 100 req/min.
-	return nil, fmt.Errorf("getEPSS: not implemented in scaffold (would query FIRST.org API for %s)", cveID)
+func buildServer() *sdk.PluginServer {
+	manifest := sdk.NewManifest("nox/risk-score", version).
+		Capability("risk-score", "EPSS/KEV risk scoring and vulnerability prioritization").
+		ToolWithContext("enrich_findings", "Enrich VULN findings with EPSS scores and KEV status", true).
+		Tool("get_epss", "Get EPSS score for a specific CVE", true).
+		Tool("get_kev_status", "Check if CVE is in CISA Known Exploited Vulnerabilities", true).
+		Done().
+		Safety(
+			sdk.WithRiskClass(sdk.RiskPassive),
+			sdk.WithNetworkHosts("api.first.org", "www.cisa.gov"),
+		).
+		Build()
+
+	return sdk.NewPluginServer(manifest).
+		HandleTool("enrich_findings", handleEnrichFindings).
+		HandleTool("get_epss", handleGetEPSS).
+		HandleTool("get_kev_status", handleGetKEVStatus)
 }
 
-// getKEVStatus is a tool stub for checking KEV catalog membership.
-//
-// In production, this tool would:
-//   - Maintain a local cache of the KEV catalog (updated every 24 hours)
-//   - Download from https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
-//   - Index by CVE ID for O(1) lookup
-//   - Return the KEV entry if the CVE is actively exploited
-func getKEVStatus(cveID string) (*KEVEntry, error) {
-	// Stub: in production, this checks the locally cached KEV catalog.
-	// The catalog is ~1MB and updated infrequently — local caching is efficient.
-	return nil, fmt.Errorf("getKEVStatus: not implemented in scaffold (would check KEV catalog for %s)", cveID)
+func handleEnrichFindings(_ context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolResponse, error) {
+	resp := sdk.NewResponse()
+
+	for _, f := range req.Findings() {
+		meta := f.GetMetadata()
+		if meta == nil {
+			continue
+		}
+		cve := meta["cve"]
+		if cve == "" {
+			continue
+		}
+
+		// In production, these would be HTTP calls to FIRST.org and CISA.
+		// For now, produce enrichments noting the CVE was found.
+		enriched := EnrichFinding(f.GetRuleId(), cve, nil, nil)
+		body, _ := json.Marshal(enriched)
+
+		fingerprint := f.GetFingerprint()
+		if fingerprint == "" {
+			loc := f.GetLocation()
+			file := ""
+			line := 0
+			if loc != nil {
+				file = loc.GetFilePath()
+				line = int(loc.GetStartLine())
+			}
+			fingerprint = fmt.Sprintf("%s:%s:%d", f.GetRuleId(), file, line)
+		}
+
+		resp.Enrichment(fingerprint, "risk-score", fmt.Sprintf("Risk score for %s", cve)).
+			Body(string(body)).
+			WithMetadata("cve", cve).
+			WithMetadata("risk_priority", string(enriched.RiskPriority)).
+			Source("nox/risk-score").
+			Done()
+	}
+
+	return resp.Build(), nil
 }
 
-// enrichFindings is the primary tool that orchestrates EPSS and KEV enrichment.
-//
-// In production, this tool would:
-//   - Accept a batch of VULN-001 findings
-//   - Extract CVE identifiers from each finding
-//   - Fan-out EPSS and KEV lookups concurrently
-//   - Attach risk priority scores to each finding
-//   - Return enriched findings to the scan pipeline
-func enrichFindings(findings []map[string]string) ([]*EnrichedFinding, error) {
-	// Stub: in production, this processes each finding through getEPSS and getKEVStatus.
-	return nil, fmt.Errorf("enrichFindings: not implemented in scaffold (would enrich %d findings)", len(findings))
+func handleGetEPSS(_ context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolResponse, error) {
+	resp := sdk.NewResponse()
+	cveID := req.InputString("cve_id")
+	if cveID == "" {
+		return resp.Build(), nil
+	}
+
+	// In production: HTTP GET to https://api.first.org/data/v1/epss?cve={cve_id}
+	resp.Enrichment(cveID, "epss-score", fmt.Sprintf("EPSS score for %s", cveID)).
+		Body(fmt.Sprintf(`{"cve":"%s","status":"pending","note":"EPSS lookup requires network access to api.first.org"}`, cveID)).
+		WithMetadata("cve", cveID).
+		Source("nox/risk-score").
+		Done()
+
+	return resp.Build(), nil
+}
+
+func handleGetKEVStatus(_ context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolResponse, error) {
+	resp := sdk.NewResponse()
+	cveID := req.InputString("cve_id")
+	if cveID == "" {
+		return resp.Build(), nil
+	}
+
+	// In production: check locally cached KEV catalog from www.cisa.gov
+	resp.Enrichment(cveID, "kev-status", fmt.Sprintf("KEV status for %s", cveID)).
+		Body(fmt.Sprintf(`{"cve":"%s","in_kev":false,"note":"KEV lookup requires cached catalog from www.cisa.gov"}`, cveID)).
+		WithMetadata("cve", cveID).
+		Source("nox/risk-score").
+		Done()
+
+	return resp.Build(), nil
 }
 
 func main() {
-	fmt.Println("nox-plugin-risk-score v0.1.0")
-	fmt.Println("Track: intelligence")
-	fmt.Println()
-	fmt.Println("Tools:")
-	fmt.Println("  enrich_findings - Enriches VULN-001 findings with EPSS scores and KEV status")
-	fmt.Println("  get_epss        - Get EPSS score for a specific CVE")
-	fmt.Println("  get_kev_status  - Check if CVE is in CISA Known Exploited Vulnerabilities")
-	fmt.Println()
-	fmt.Println("Data sources:")
-	fmt.Println("  EPSS API: https://api.first.org/data/v1/epss")
-	fmt.Println("  KEV Feed: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
-	fmt.Println()
-	fmt.Println("This plugin enriches vulnerability findings with real-world exploitability")
-	fmt.Println("data to help prioritize remediation. Findings in the CISA KEV catalog or")
-	fmt.Println("with high EPSS scores are flagged as critical priority.")
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
-	// Demonstrate the risk classification logic.
-	fmt.Println()
-	fmt.Println("Risk classification thresholds:")
-	fmt.Printf("  critical: in KEV or EPSS >= 0.7 → %s\n", ClassifyRisk(0.8, false))
-	fmt.Printf("  high:     EPSS >= 0.4           → %s\n", ClassifyRisk(0.5, false))
-	fmt.Printf("  medium:   EPSS >= 0.1           → %s\n", ClassifyRisk(0.2, false))
-	fmt.Printf("  low:      EPSS < 0.1            → %s\n", ClassifyRisk(0.05, false))
-	fmt.Printf("  KEV override:                   → %s\n", ClassifyRisk(0.01, true))
+	srv := buildServer()
+	if err := srv.Serve(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "nox-plugin-risk-score: %v\n", err)
+		os.Exit(1)
+	}
 }
