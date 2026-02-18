@@ -212,7 +212,7 @@ func handleGetEPSS(_ context.Context, req sdk.ToolRequest) (*pluginv1.InvokeTool
 
 	// In production: HTTP GET to https://api.first.org/data/v1/epss?cve={cve_id}
 	resp.Enrichment(cveID, "epss-score", fmt.Sprintf("EPSS score for %s", cveID)).
-		Body(fmt.Sprintf(`{"cve":"%s","status":"pending","note":"EPSS lookup requires network access to api.first.org"}`, cveID)).
+		Body(fmt.Sprintf(`{"cve":%q,"status":"pending","note":"EPSS lookup requires network access to api.first.org"}`, cveID)).
 		WithMetadata("cve", cveID).
 		Source("nox/risk-score").
 		Done()
@@ -229,7 +229,7 @@ func handleGetKEVStatus(_ context.Context, req sdk.ToolRequest) (*pluginv1.Invok
 
 	// In production: check locally cached KEV catalog from www.cisa.gov
 	resp.Enrichment(cveID, "kev-status", fmt.Sprintf("KEV status for %s", cveID)).
-		Body(fmt.Sprintf(`{"cve":"%s","in_kev":false,"note":"KEV lookup requires cached catalog from www.cisa.gov"}`, cveID)).
+		Body(fmt.Sprintf(`{"cve":%q,"in_kev":false,"note":"KEV lookup requires cached catalog from www.cisa.gov"}`, cveID)).
 		WithMetadata("cve", cveID).
 		Source("nox/risk-score").
 		Done()
@@ -237,12 +237,15 @@ func handleGetKEVStatus(_ context.Context, req sdk.ToolRequest) (*pluginv1.Invok
 	return resp.Build(), nil
 }
 
-func main() {
+func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	srv := buildServer()
-	if err := srv.Serve(ctx); err != nil {
+	return buildServer().Serve(ctx)
+}
+
+func main() {
+	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "nox-plugin-risk-score: %v\n", err)
 		os.Exit(1)
 	}
