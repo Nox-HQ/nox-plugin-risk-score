@@ -1,9 +1,26 @@
-# Binaries
-nox-plugin-risk-score
+# Binary
+/nox-plugin-*
+
+# Go
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 *.test
 *.out
 
 # IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
