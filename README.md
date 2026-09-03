@@ -1,3 +1,46 @@
+> ## ⚠️ Archived — superseded by nox core, and it reported a false negative
+>
+> **Do not install this plugin.** EPSS and KEV prioritisation is served by NOX
+> Intelligence, which has been the default advisory source for every online
+> scan since nox 1.33.0 (verified against OSV.dev).
+>
+> Archived because it never had a working data path, and its stub answered in
+> the dangerous direction:
+>
+> ```
+> $ nox plugin call nox/risk-score get_kev_status cve_id=CVE-2021-44228
+> {"cve":"CVE-2021-44228","in_kev":false,
+>  "note":"KEV lookup requires cached catalog from www.cisa.gov"}
+> ```
+>
+> `in_kev: false` for **Log4Shell**, which has been in the CISA KEV catalogue
+> since the day it was published. The note admits the catalogue was never
+> fetched — so `false` here means *unknown*, and anyone reading the field
+> deprioritises accordingly. `get_epss` handled the same situation honestly
+> (`status: pending`); `get_kev_status` did not. The same result with
+> `api.first.org` and `www.cisa.gov` added to `plugin_policy.allowed_network_hosts`,
+> so this was not the sandbox denying a fetch — there was no fetch.
+>
+> Measured 2026-09-03 on the npm/cli v9.0.0 lockfile (121 dependency findings,
+> 6 critical, 66 high), plugin registered and network allowed:
+>
+> | | +findings | +enrichments | severity distribution |
+> |---|---|---|---|
+> | core 1.33.0 + nox/risk-score | 0 | 0 | unchanged |
+>
+> **Remove it:**
+>
+> ```bash
+> nox plugin remove nox/risk-score
+> ```
+>
+> Then drop `nox/risk-score` from `plugins.required` in `.nox.yaml`. Nothing
+> replaces it: EPSS/KEV context arrives with the advisory itself.
+>
+> Detail in [#44](https://github.com/Nox-HQ/nox-plugin-risk-score/issues/44).
+
+---
+
 # nox-plugin-risk-score
 
 **Enrich vulnerability findings with EPSS scores and CISA KEV status for evidence-based prioritization.**
